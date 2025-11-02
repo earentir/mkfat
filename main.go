@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -474,6 +475,247 @@ func initFAT32(b []byte, media byte) {
 /* ===================== TUI ===================== */
 /* TUI moved to package retrodfrg */
 
+// progressTracker tracks write progress in main.go (not in UI package)
+type progressTracker struct {
+	progressMap  []bool
+	totalSectors int64
+	currentPos   int64
+}
+
+func newProgressTracker(total int64) *progressTracker {
+	return &progressTracker{
+		progressMap:  make([]bool, total),
+		totalSectors: total,
+	}
+}
+
+func (pt *progressTracker) markRange(start int64, count int64) {
+	end := start + count
+	if end > pt.totalSectors {
+		end = pt.totalSectors
+	}
+	for i := start; i < end; i++ {
+		if i >= 0 && i < int64(len(pt.progressMap)) {
+			pt.progressMap[i] = true
+		}
+	}
+	if end-1 >= 0 {
+		pt.currentPos = end - 1
+	}
+}
+
+func (pt *progressTracker) writtenCount() int64 {
+	count := int64(0)
+	for _, written := range pt.progressMap {
+		if written {
+			count++
+		}
+	}
+	return count
+}
+
+// updateProgressMapVisualization generates visual progress map from tracker and updates UI.
+func updateProgressMapVisualization(ui *retrodfrg.UI, pt *progressTracker, systemRanges [][2]int64, w, h int) {
+	if pt.totalSectors <= 0 {
+		return
+	}
+
+	// Calculate available space
+	availRows := h - 7 // leave room for other UI elements
+	if availRows < 1 {
+		availRows = 1
+	}
+	totalCells := int64(w * availRows)
+
+	// Calculate start position (scroll to follow current position)
+	start := int64(0)
+	if pt.totalSectors > totalCells {
+		if pt.currentPos >= totalCells-1 {
+			start = pt.currentPos - (totalCells - 1)
+		}
+		if start+totalCells > pt.totalSectors {
+			start = pt.totalSectors - totalCells
+		}
+		if start < 0 {
+			start = 0
+		}
+	}
+
+	// Build visual map
+	lines := make([]string, availRows)
+	full := '█'
+	free := '░'
+	sys := '■'
+
+	inSystem := func(abs int64) bool {
+		for _, r := range systemRanges {
+			if abs >= r[0] && abs <= r[1] {
+				return true
+			}
+		}
+		return false
+	}
+
+	for row := 0; row < availRows; row++ {
+		var b strings.Builder
+		b.Grow(w) // Pre-allocate for efficiency
+		for col := 0; col < w; col++ {
+			idx := int64(row*w + col)
+			if idx >= totalCells {
+				break
+			}
+			abs := start + idx
+			if abs >= pt.totalSectors {
+				break
+			}
+
+			var rch rune = free
+			if abs >= 0 && abs < int64(len(pt.progressMap)) && pt.progressMap[abs] {
+				rch = full
+			} else if inSystem(abs) {
+				rch = sys
+			}
+			b.WriteRune(rch)
+		}
+		lines[row] = b.String()
+	}
+
+	ui.SetProgressMap(lines)
+}
+
+// updateStatusLines updates the UI status lines with current progress information.
+func updateStatusLines(ui *retrodfrg.UI, pt *progressTracker, startTime time.Time, currentOp string, emuRate float64, isEmulate bool, systemRanges [][2]int64) {
+	written := pt.writtenCount()
+	curPos := pt.currentPos
+	totalSectors := pt.totalSectors
+	elapsed := time.Since(startTime).Truncate(time.Second)
+
+	// Update progress map visualization
+	if ui != nil {
+		w, h := ui.Size()
+		if w > 0 && h > 0 {
+			updateProgressMapVisualization(ui, pt, systemRanges, w, h)
+		}
+	}
+
+	var rate float64
+	if isEmulate {
+		rate = emuRate
+	} else {
+		if elapsed.Seconds() > 0 {
+			rate = float64(written*512) / elapsed.Seconds()
+		}
+	}
+
+	var etaStr string
+	if rate > 0 {
+		remainBytes := (totalSectors - written) * 512
+		eta := time.Duration(float64(remainBytes) / rate * float64(time.Second)).Truncate(time.Second)
+		etaStr = eta.String()
+	} else {
+		etaStr = "—"
+	}
+
+	mode := "REAL"
+	if isEmulate {
+		mode = "EMULATE"
+	}
+
+	rateStr := human(int64(rate))
+
+	lines := []string{
+		fmt.Sprintf("Absolute: %06d", curPos),
+		fmt.Sprintf("Written: %d / %d sectors", written, totalSectors),
+		fmt.Sprintf("Elapsed: %s   Rate: %s/s   ETA: %s   Mode: %s", elapsed, rateStr, etaStr, mode),
+		"Current op: " + currentOp,
+	}
+	ui.SetStatusLines(lines)
+}
+
+// writeSpanWithStatus writes a buffer and updates status lines periodically.
+func writeSpanWithStatus(w io.WriterAt, absStart int64, buf []byte, ui *retrodfrg.UI, pt *progressTracker, currentOp string, startTime time.Time, emuRate float64, isEmulate bool, systemRanges [][2]int64) error {
+	const chunk = 1 << 20
+	wr := int64(0)
+	updateCount := 0
+	for wr < int64(len(buf)) {
+		n := int64(len(buf)) - wr
+		if n > chunk {
+			n = chunk
+		}
+		if _, err := w.WriteAt(buf[wr:wr+n], (absStart*512)+wr); err != nil {
+			return err
+		}
+		secs := n / 512
+		if secs <= 0 {
+			secs = 1
+		}
+		pt.markRange(absStart+wr/512, secs)
+		if ui.IsStopped() {
+			return retrodfrg.ErrInterrupted
+		}
+		// Update status periodically or on first/last chunk
+		if currentOp != "" && (wr == 0 || updateCount%5 == 0 || wr+n >= int64(len(buf))) {
+			updateStatusLines(ui, pt, startTime, currentOp, emuRate, isEmulate, systemRanges)
+		}
+		ui.LayoutAndDraw()
+		wr += n
+		updateCount++
+	}
+	if currentOp != "" {
+		updateStatusLines(ui, pt, startTime, currentOp, emuRate, isEmulate, systemRanges)
+	}
+	ui.LayoutAndDraw()
+	return nil
+}
+
+// zeroSpanWithStatus writes zeroes and updates status lines periodically.
+func zeroSpanWithStatus(w io.WriterAt, absStart, sectors int64, ui *retrodfrg.UI, pt *progressTracker, currentOp string, startTime time.Time, emuRate float64, isEmulate bool, systemRanges [][2]int64) error {
+	const zSize = 1 << 20
+	z := make([]byte, zSize)
+	written := int64(0)
+	bytes := sectors * 512
+	updateCount := 0
+	for written < bytes {
+		k := bytes - written
+		if k > zSize {
+			k = zSize
+		}
+		if _, err := w.WriteAt(z[:k], (absStart*512 + written)); err != nil {
+			return err
+		}
+		secs := k / 512
+		if secs <= 0 {
+			secs = 1
+		}
+		pt.markRange(absStart+written/512, secs)
+		if ui.IsStopped() {
+			return retrodfrg.ErrInterrupted
+		}
+		// Update status periodically or on first/last chunk
+		if currentOp != "" && (written == 0 || updateCount%5 == 0 || written+k >= bytes) {
+			updateStatusLines(ui, pt, startTime, currentOp, emuRate, isEmulate, systemRanges)
+		}
+		ui.LayoutAndDraw()
+		written += k
+		updateCount++
+	}
+	if currentOp != "" {
+		updateStatusLines(ui, pt, startTime, currentOp, emuRate, isEmulate, systemRanges)
+	}
+	ui.LayoutAndDraw()
+	return nil
+}
+
+// waitWithStop waits briefly while allowing early interruption.
+func waitWithStop(ui *retrodfrg.UI) error {
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	}
+}
+
 /* ===================== Emulation pacing ===================== */
 
 func defaultEmuBPS(size int64) float64 {
@@ -499,7 +741,7 @@ func (n nullWriter) WriteAt(p []byte, _ int64) (int, error) {
 
 // old emulateSequence removed; handled inline using retrodfrg helpers
 
-// old waitWithStop removed; use retrodfrg.WaitWithStop
+// old waitWithStop removed; use waitWithStop
 
 /* ===================== IO helpers (moved to retrodfrg) ===================== */
 
@@ -539,7 +781,7 @@ func checkBadSector(rw interface {
 func fullFormatDataArea(rw interface {
 	WriteAt([]byte, int64) (int, error)
 	ReadAt([]byte, int64) (int, error)
-}, absStart, sectors int64, u *retrodfrg.UI) error {
+}, absStart, sectors int64, u *retrodfrg.UI, pt *progressTracker, currentOp string, startTime time.Time, systemRanges [][2]int64) error {
 	const zSize = 1 << 20
 	z := make([]byte, zSize)
 	written := int64(0)
@@ -577,7 +819,11 @@ func fullFormatDataArea(rw interface {
 				}
 			}
 
-			u.MarkRange(currentSector, 1)
+			pt.markRange(currentSector, 1)
+			// Update status every 10 sectors
+			if i%10 == 0 || i == secs-1 {
+				updateStatusLines(u, pt, startTime, currentOp, 0, false, systemRanges)
+			}
 			u.LayoutAndDraw()
 		}
 		written += k
@@ -895,16 +1141,20 @@ func main() {
 				return err
 			}
 
-			ui, err := retrodfrg.NewUI(retrodfrg.FATType(ft), "A", sz, nil)
+			ui, err := retrodfrg.NewUI()
 			if err != nil {
 				return fmt.Errorf("ui init: %w", err)
 			}
 			defer ui.Close()
 
+			startTime := time.Now()
+			totalSectors := int64(sz / 512)
+			pt := newProgressTracker(totalSectors)
+
 			// Generic UI config
 			ui.SetTitle(fmt.Sprintf("FORMAT – DRIVE %s:  FAT%d  %d bytes", "A", ft, sz))
 			ui.SetPhases([]string{"Boot", "FAT1", "FAT2", "Root"})
-			// Compute absolute ranges and mark as system
+			// Compute absolute ranges
 			absFAT1 := int64(g.ReservedSectors)
 			absFAT2 := absFAT1 + int64(fatSecs)
 			absRoot := int64(-1)
@@ -913,23 +1163,21 @@ func main() {
 				absRoot = absData
 				absData += int64(rootSecs)
 			}
-			ranges := [][2]int64{
+			systemRanges := [][2]int64{
 				{0, 0},
 				{absFAT1, absFAT1 + int64(fatSecs) - 1},
 				{absFAT2, absFAT2 + int64(fatSecs) - 1},
 			}
 			if ft != FAT32 {
-				ranges = append(ranges, [2]int64{absRoot, absRoot + int64(rootSecs) - 1})
+				systemRanges = append(systemRanges, [2]int64{absRoot, absRoot + int64(rootSecs) - 1})
 			}
-			ui.SetSystemRanges(ranges)
 			ui.SetSummaryLines([]string{
 				fmt.Sprintf("Bytes/Sector: %-4d  Sectors/Track: %-2d  Heads: %-2d", g.BytesPerSector, g.SectorsPerTrack, g.NumHeads),
 				fmt.Sprintf("Reserved: %-3d  FATs: %-1d  Root entries: %-3d", g.ReservedSectors, g.NumFATs, g.RootEntries),
 				fmt.Sprintf("Sectors/FAT: %-4d  RootDir sectors: %-3d  Data sectors: %-4d", fatSecs, rootSecs, dataSecs),
 			})
 			ui.SetLegend([]string{
-				"Legend:  █ formatted/written   ░ not yet written   ■ system area",
-				"Keys: Q quit",
+				"Legend:  █ formatted/written   ░ not yet written   ■ system area | Q to quit",
 			})
 
 			// Setup Ctrl+C handler to exit immediately
@@ -943,11 +1191,11 @@ func main() {
 			}()
 
 			if emulate {
-				ui.SetRate(defaultEmuBPS(sz)) // show emulated rate
+				emuRate := defaultEmuBPS(sz)
+				updateStatusLines(ui, pt, startTime, "Write boot sector", emuRate, true, systemRanges)
 				ui.LayoutAndDraw()
 				// Emulate using nullWriter and helpers
 				nw := nullWriter{}
-				ui.SetEmu(true)
 				// boot
 				var boot []byte
 				if ft == FAT32 {
@@ -955,25 +1203,28 @@ func main() {
 				} else {
 					boot = buildBootSector1216(ft, g, label, oem)
 				}
-				ui.SetCurrentOp("Write boot sector")
-				if err := retrodfrg.WriteSpan(nw, 0, boot, ui); err != nil && !errors.Is(err, retrodfrg.ErrInterrupted) {
+				if err := writeSpanWithStatus(nw, 0, boot, ui, pt, "Write boot sector", startTime, emuRate, true, systemRanges); err != nil && !errors.Is(err, retrodfrg.ErrInterrupted) {
 					return err
 				}
 				ui.SetPhaseDone("boot")
+				updateStatusLines(ui, pt, startTime, "Write boot sector", emuRate, true, systemRanges)
 				ui.LayoutAndDraw()
 				if ft == FAT32 {
-					ui.SetCurrentOp("Write FSInfo")
+					updateStatusLines(ui, pt, startTime, "Write FSInfo", emuRate, true, systemRanges)
+					ui.LayoutAndDraw()
 					fsinfo := buildFSInfo()
-					if err := retrodfrg.WriteSpan(nw, int64(g.FSInfoSector), fsinfo, ui); err != nil && !errors.Is(err, retrodfrg.ErrInterrupted) {
+					if err := writeSpanWithStatus(nw, int64(g.FSInfoSector), fsinfo, ui, pt, "Write FSInfo", startTime, emuRate, true, systemRanges); err != nil && !errors.Is(err, retrodfrg.ErrInterrupted) {
 						return err
 					}
-					ui.SetCurrentOp("Backup boot sector")
-					if err := retrodfrg.WriteSpan(nw, int64(g.BackupBootSector), boot, ui); err != nil && !errors.Is(err, retrodfrg.ErrInterrupted) {
+					updateStatusLines(ui, pt, startTime, "Backup boot sector", emuRate, true, systemRanges)
+					ui.LayoutAndDraw()
+					if err := writeSpanWithStatus(nw, int64(g.BackupBootSector), boot, ui, pt, "Backup boot sector", startTime, emuRate, true, systemRanges); err != nil && !errors.Is(err, retrodfrg.ErrInterrupted) {
 						return err
 					}
 				}
 				// FATs
-				ui.SetCurrentOp("Initialize FAT #1")
+				updateStatusLines(ui, pt, startTime, "Initialize FAT #1", emuRate, true, systemRanges)
+				ui.LayoutAndDraw()
 				fatBytes := int64(fatSecs) * int64(g.BytesPerSector)
 				fatBuf := make([]byte, fatBytes)
 				if ft == FAT32 {
@@ -981,39 +1232,44 @@ func main() {
 				} else {
 					initFAT1216(ft, fatBuf, g.Media)
 				}
-				if err := retrodfrg.WriteSpan(nw, int64(g.ReservedSectors), fatBuf, ui); err != nil && !errors.Is(err, retrodfrg.ErrInterrupted) {
+				if err := writeSpanWithStatus(nw, int64(g.ReservedSectors), fatBuf, ui, pt, "Initialize FAT #1", startTime, emuRate, true, systemRanges); err != nil && !errors.Is(err, retrodfrg.ErrInterrupted) {
 					return err
 				}
 				ui.SetPhaseDone("fat1")
+				updateStatusLines(ui, pt, startTime, "Initialize FAT #1", emuRate, true, systemRanges)
 				ui.LayoutAndDraw()
-				if err := retrodfrg.WriteSpan(nw, int64(g.ReservedSectors)+int64(fatSecs), fatBuf, ui); err != nil && !errors.Is(err, retrodfrg.ErrInterrupted) {
+				if err := writeSpanWithStatus(nw, int64(g.ReservedSectors)+int64(fatSecs), fatBuf, ui, pt, "Initialize FAT #2", startTime, emuRate, true, systemRanges); err != nil && !errors.Is(err, retrodfrg.ErrInterrupted) {
 					return err
 				}
 				ui.SetPhaseDone("fat2")
+				updateStatusLines(ui, pt, startTime, "Initialize FAT #2", emuRate, true, systemRanges)
 				ui.LayoutAndDraw()
 				// Root (if 12/16)
 				if ft != FAT32 {
-					ui.SetCurrentOp("Clear root directory")
+					updateStatusLines(ui, pt, startTime, "Clear root directory", emuRate, true, systemRanges)
+					ui.LayoutAndDraw()
 					absRoot := int64(g.ReservedSectors) + int64(g.NumFATs)*int64(fatSecs)
-					if err := retrodfrg.ZeroSpan(nw, absRoot, int64(rootSecs), ui); err != nil && !errors.Is(err, retrodfrg.ErrInterrupted) {
+					if err := zeroSpanWithStatus(nw, absRoot, int64(rootSecs), ui, pt, "Clear root directory", startTime, emuRate, true, systemRanges); err != nil && !errors.Is(err, retrodfrg.ErrInterrupted) {
 						return err
 					}
 					ui.SetPhaseDone("root")
+					updateStatusLines(ui, pt, startTime, "Clear root directory", emuRate, true, systemRanges)
 					ui.LayoutAndDraw()
 				}
 				// Data area
-				ui.SetCurrentOp("Format data area")
+				updateStatusLines(ui, pt, startTime, "Format data area", emuRate, true, systemRanges)
+				ui.LayoutAndDraw()
 				absData := int64(g.ReservedSectors) + int64(g.NumFATs)*int64(fatSecs)
 				if ft != FAT32 {
 					absData += int64(rootSecs)
 				}
 				remaining := int64(sz/512) - absData
 				if remaining > 0 {
-					_ = retrodfrg.ZeroSpan(nw, absData, remaining, ui)
+					_ = zeroSpanWithStatus(nw, absData, remaining, ui, pt, "Format data area", startTime, emuRate, true, systemRanges)
 				}
-				ui.SetCurrentOp("Format complete")
+				updateStatusLines(ui, pt, startTime, "Format complete", emuRate, true, systemRanges)
 				ui.LayoutAndDraw()
-				_ = retrodfrg.WaitWithStop(ui)
+				_ = waitWithStop(ui)
 				ui.Close()
 
 				printGeometryInfo(ft, sz, g, fatSecs, rootSecs, dataSecs, clusters, label, oem)
@@ -1103,39 +1359,41 @@ func main() {
 				sink = file
 			}
 
-			ui.SetEmu(false)
-			ui.SetUpdateEvery(1)
 			ui.LayoutAndDraw()
 
 			// Boot
-			ui.SetCurrentOp("Write boot sector")
+			updateStatusLines(ui, pt, startTime, "Write boot sector", 0, false, systemRanges)
+			ui.LayoutAndDraw()
 			var boot []byte
 			if ft == FAT32 {
 				boot = buildBootSector32(g, label, oem)
 			} else {
 				boot = buildBootSector1216(ft, g, label, oem)
 			}
-			if err := retrodfrg.WriteSpan(sink, 0, boot, ui); err != nil {
+			if err := writeSpanWithStatus(sink, 0, boot, ui, pt, "Write boot sector", startTime, 0, false, systemRanges); err != nil {
 				return err
 			}
 			if file != nil {
 				_ = file.Sync()
 			}
 			ui.SetPhaseDone("boot")
+			updateStatusLines(ui, pt, startTime, "Write boot sector", 0, false, systemRanges)
 			ui.LayoutAndDraw()
 
 			// FSInfo + backup for FAT32
 			if ft == FAT32 {
-				ui.SetCurrentOp("Write FSInfo")
+				updateStatusLines(ui, pt, startTime, "Write FSInfo", 0, false, systemRanges)
+				ui.LayoutAndDraw()
 				fsinfo := buildFSInfo()
-				if err := retrodfrg.WriteSpan(sink, int64(g.FSInfoSector), fsinfo, ui); err != nil {
+				if err := writeSpanWithStatus(sink, int64(g.FSInfoSector), fsinfo, ui, pt, "Write FSInfo", startTime, 0, false, systemRanges); err != nil {
 					return err
 				}
 				if file != nil {
 					_ = file.Sync()
 				}
-				ui.SetCurrentOp("Backup boot sector")
-				if err := retrodfrg.WriteSpan(sink, int64(g.BackupBootSector), boot, ui); err != nil {
+				updateStatusLines(ui, pt, startTime, "Backup boot sector", 0, false, systemRanges)
+				ui.LayoutAndDraw()
+				if err := writeSpanWithStatus(sink, int64(g.BackupBootSector), boot, ui, pt, "Backup boot sector", startTime, 0, false, systemRanges); err != nil {
 					return err
 				}
 				if file != nil {
@@ -1144,7 +1402,8 @@ func main() {
 			}
 
 			// FAT #1
-			ui.SetCurrentOp("Initialize FAT #1")
+			updateStatusLines(ui, pt, startTime, "Initialize FAT #1", 0, false, systemRanges)
+			ui.LayoutAndDraw()
 			fatBytes := int64(fatSecs) * int64(g.BytesPerSector)
 			fatBuf := make([]byte, fatBytes)
 			if ft == FAT32 {
@@ -1152,30 +1411,34 @@ func main() {
 			} else {
 				initFAT1216(ft, fatBuf, g.Media)
 			}
-			if err := retrodfrg.WriteSpan(sink, absFAT1, fatBuf, ui); err != nil {
+			if err := writeSpanWithStatus(sink, absFAT1, fatBuf, ui, pt, "Initialize FAT #1", startTime, 0, false, systemRanges); err != nil {
 				return err
 			}
 			if file != nil {
 				_ = file.Sync()
 			}
 			ui.SetPhaseDone("fat1")
+			updateStatusLines(ui, pt, startTime, "Initialize FAT #1", 0, false, systemRanges)
 			ui.LayoutAndDraw()
 
 			// FAT #2
-			ui.SetCurrentOp("Duplicate FAT #2")
-			if err := retrodfrg.WriteSpan(sink, absFAT2, fatBuf, ui); err != nil {
+			updateStatusLines(ui, pt, startTime, "Duplicate FAT #2", 0, false, systemRanges)
+			ui.LayoutAndDraw()
+			if err := writeSpanWithStatus(sink, absFAT2, fatBuf, ui, pt, "Duplicate FAT #2", startTime, 0, false, systemRanges); err != nil {
 				return err
 			}
 			if file != nil {
 				_ = file.Sync()
 			}
 			ui.SetPhaseDone("fat2")
+			updateStatusLines(ui, pt, startTime, "Duplicate FAT #2", 0, false, systemRanges)
 			ui.LayoutAndDraw()
 
 			// Root (1216)
 			if ft != FAT32 {
-				ui.SetCurrentOp("Clear root directory")
-				if err := retrodfrg.ZeroSpan(sink, absRoot, int64(rootSecs), ui); err != nil {
+				updateStatusLines(ui, pt, startTime, "Clear root directory", 0, false, systemRanges)
+				ui.LayoutAndDraw()
+				if err := zeroSpanWithStatus(sink, absRoot, int64(rootSecs), ui, pt, "Clear root directory", startTime, 0, false, systemRanges); err != nil {
 					return err
 				}
 				if file != nil {
@@ -1186,13 +1449,13 @@ func main() {
 					if _, err := file.WriteAt(entry, (absRoot * 512)); err != nil {
 						return err
 					}
-					ui.MarkRange(absRoot, 1)
 					ui.LayoutAndDraw()
 				}
 				ui.SetPhaseDone("root")
+				updateStatusLines(ui, pt, startTime, "Clear root directory", 0, false, systemRanges)
 				ui.LayoutAndDraw()
 			} else {
-				_ = retrodfrg.ZeroSpan(sink, absData, 1, ui)
+				_ = zeroSpanWithStatus(sink, absData, 1, ui, pt, "Clear root directory", startTime, 0, false, systemRanges)
 				if file != nil {
 					_ = file.Sync()
 				}
@@ -1200,31 +1463,34 @@ func main() {
 
 			// Full format data area with sync policy
 			if fullFormat {
-				remainingSectors := ui.TotalSectors() - absData
+				remainingSectors := int64(sz/512) - absData
 				if remainingSectors > 0 {
 					switch strings.ToLower(syncMode) {
 					case "sector":
-						ui.SetCurrentOp("Full format (sector): zeroing data area")
-						if err := fullFormatDataArea(file, absData, remainingSectors, ui); err != nil {
+						updateStatusLines(ui, pt, startTime, "Full format (sector): zeroing data area", 0, false, systemRanges)
+						ui.LayoutAndDraw()
+						if err := fullFormatDataArea(file, absData, remainingSectors, ui, pt, "Full format (sector): zeroing data area", startTime, systemRanges); err != nil {
 							fmt.Fprintf(os.Stderr, "\nWARNING: %v\n", err)
 						}
 					case "track", "phase", "none":
-						ui.SetCurrentOp("Full format (track): zeroing data area")
-						if err := fullFormatTrack(file, absData, remainingSectors, int(g.SectorsPerTrack), ui, syncMode); err != nil {
+						updateStatusLines(ui, pt, startTime, "Full format (track): zeroing data area", 0, false, systemRanges)
+						ui.LayoutAndDraw()
+						if err := fullFormatTrack(file, absData, remainingSectors, int(g.SectorsPerTrack), ui, pt, syncMode, "Full format (track): zeroing data area", startTime, systemRanges); err != nil {
 							fmt.Fprintf(os.Stderr, "\nWARNING: %v\n", err)
 						}
 						if verifyTrack {
-							ui.SetCurrentOp("Verify data area (track)")
+							updateStatusLines(ui, pt, startTime, "Verify data area (track)", 0, false, systemRanges)
+							ui.LayoutAndDraw()
 							_ = verifyTrackRead(file, absData, remainingSectors, int(g.SectorsPerTrack))
 						}
 					}
 				}
 			}
 
-			ui.SetCurrentOp("Format complete")
+			updateStatusLines(ui, pt, startTime, "Format complete", 0, false, systemRanges)
 			ui.LayoutAndDraw()
 
-			if err := retrodfrg.WaitWithStop(ui); err != nil && !errors.Is(err, retrodfrg.ErrInterrupted) {
+			if err := waitWithStop(ui); err != nil && !errors.Is(err, retrodfrg.ErrInterrupted) {
 				return err
 			}
 			ui.Close()
@@ -1802,7 +2068,7 @@ func getDeviceDetails(path string) (string, string, string) {
 }
 
 // Track-based zeroing with sync policy
-func fullFormatTrack(file *os.File, absStart, sectors int64, spt int, ui *retrodfrg.UI, syncMode string) error {
+func fullFormatTrack(file *os.File, absStart, sectors int64, spt int, ui *retrodfrg.UI, pt *progressTracker, syncMode string, currentOp string, startTime time.Time, systemRanges [][2]int64) error {
 	if spt <= 0 {
 		spt = 18
 	}
@@ -1812,7 +2078,7 @@ func fullFormatTrack(file *os.File, absStart, sectors int64, spt int, ui *retrod
 		if sectors-written < chunk {
 			chunk = sectors - written
 		}
-		if err := retrodfrg.ZeroSpan(file, absStart+written, chunk, ui); err != nil {
+		if err := zeroSpanWithStatus(file, absStart+written, chunk, ui, pt, currentOp, startTime, 0, false, systemRanges); err != nil {
 			return err
 		}
 		// Sync once per track unless disabled

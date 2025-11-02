@@ -1,3 +1,5 @@
+// Package retrodfrg provides a generic terminal UI for displaying progress and status information.
+// It is designed to be completely agnostic of the underlying task being performed.
 package retrodfrg
 
 import (
@@ -5,37 +7,17 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/gdamore/tcell/v2"
 )
 
-type FATType int
-
-const (
-	FAT12 FATType = 12
-	FAT16 FATType = 16
-	FAT32 FATType = 32
-)
-
+// ErrInterrupted is returned when the user requests to stop the operation.
 var ErrInterrupted = errors.New("interrupted")
 
+// UI provides a terminal-based user interface for displaying customizable information.
+// It supports title, summary lines, legend, phases, and status lines.
 type UI struct {
-	s            tcell.Screen
-	sectorMap    []bool
-	start        time.Time
-	currentOp    string
-	drive        string
-	bytesTotal   int64
-	totalSectors int64
-	written      int64
-	curAbs       int64
-	rateBps      float64
-
-	full     rune
-	free     rune
-	sys      rune
-	emulate  bool
+	s        tcell.Screen
 	stopChan chan struct{}
 	once     sync.Once
 
@@ -43,19 +25,17 @@ type UI struct {
 	title        string
 	phases       []string
 	phaseDoneMap map[string]bool
-	systemRanges []struct{ start, end int64 } // inclusive
 	summaryLines []string
 	legendLines  []string
 	statusLines  []string
 
-	// Rendering throttle: update UI every N sectors when not emulating (>=1)
-	updateEvery int
-
-	// Sync policy for helpers: "sector" sync per sector; others skip per-sector
-	syncMode string
+	// Visual progress map (provided by caller, UI just renders it)
+	progressMapLines []string
 }
 
-func NewUI(_ FATType, drive string, bytesTotal int64, _ interface{}, _ ...uint32) (*UI, error) {
+// NewUI creates and initializes a new UI instance.
+// It sets up the terminal screen and starts the event loop for handling user input.
+func NewUI() (*UI, error) {
 	s, err := tcell.NewScreen()
 	if err != nil {
 		return nil, err
@@ -66,23 +46,14 @@ func NewUI(_ FATType, drive string, bytesTotal int64, _ interface{}, _ ...uint32
 	s.DisableMouse()
 	u := &UI{
 		s:            s,
-		drive:        drive,
-		bytesTotal:   bytesTotal,
-		totalSectors: int64(bytesTotal / 512),
-		full:         '█',
-		free:         '░',
-		sys:          '■',
-		start:        time.Now(),
 		stopChan:     make(chan struct{}),
 		phaseDoneMap: make(map[string]bool),
-		updateEvery:  1,
-		syncMode:     "sector",
 	}
-	u.sectorMap = make([]bool, u.totalSectors)
 	go u.eventLoop()
 	return u, nil
 }
 
+// Close closes the UI and restores the terminal to its original state.
 func (u *UI) Close() {
 	if u.s == nil {
 		return
@@ -92,6 +63,8 @@ func (u *UI) Close() {
 	fmt.Print("\033[?1049l\033[?25h")
 }
 
+// RequestStop signals that the user has requested to stop the current operation.
+// It can be called multiple times safely.
 func (u *UI) RequestStop() {
 	u.once.Do(func() {
 		close(u.stopChan)
@@ -99,6 +72,7 @@ func (u *UI) RequestStop() {
 	})
 }
 
+// IsStopped returns true if the user has requested to stop the operation.
 func (u *UI) IsStopped() bool {
 	select {
 	case <-u.stopChan:
@@ -108,12 +82,28 @@ func (u *UI) IsStopped() bool {
 	}
 }
 
+// Size returns the current screen width and height.
+func (u *UI) Size() (width, height int) {
+	if u.s == nil {
+		return 0, 0
+	}
+	return u.s.Size()
+}
+
 func putStr(s tcell.Screen, x, y int, str string) {
-	for i, r := range []rune(str) {
-		s.SetContent(x+i, y, r, nil, tcell.StyleDefault)
+	w, _ := s.Size()
+	runes := []rune(str)
+	for i, r := range runes {
+		pos := x + i
+		if pos >= w {
+			break // Don't write beyond screen width
+		}
+		s.SetContent(pos, y, r, nil, tcell.StyleDefault)
 	}
 }
 
+// LayoutAndDraw redraws the entire UI with the current state.
+// It should be called whenever the displayed information needs to be updated.
 func (u *UI) LayoutAndDraw() {
 	u.s.Clear()
 	w, h := u.s.Size()
@@ -146,20 +136,34 @@ func (u *UI) LayoutAndDraw() {
 		currentY++
 	}
 
-	// Compute available rows for sector map (leave room for phase+status: 7 lines)
-	avail := h - currentY - 7
-	if avail < 1 {
-		avail = 1
+	// Progress map visualization (if provided)
+	if len(u.progressMapLines) > 0 {
+		// Compute available rows for progress map (leave room for phase+status: 7 lines)
+		avail := h - currentY - 7
+		if avail < 1 {
+			avail = 1
+		}
+		rowsToShow := avail
+		if rowsToShow > len(u.progressMapLines) {
+			rowsToShow = len(u.progressMapLines)
+		}
+		for i := 0; i < rowsToShow && currentY < h; i++ {
+			line := u.progressMapLines[i]
+			// Truncate by rune count, not bytes
+			runes := []rune(line)
+			if len(runes) > w {
+				runes = runes[:w]
+			}
+			putStr(u.s, 0, currentY, string(runes))
+			currentY++
+		}
 	}
 
-	u.drawSectorMap(0, currentY, w, avail)
-	currentY += avail
-
 	// Phase line
-	putStr(u.s, 0, currentY, strings.Repeat("─", w))
-	putStr(u.s, 2, currentY, " Phase ")
-	currentY++
 	if len(u.phases) > 0 {
+		putStr(u.s, 0, currentY, strings.Repeat("─", w))
+		putStr(u.s, 2, currentY, " Phase ")
+		currentY++
 		check := func(ok bool) rune {
 			if ok {
 				return '✓'
@@ -179,11 +183,10 @@ func (u *UI) LayoutAndDraw() {
 	}
 
 	// Status block
-	putStr(u.s, 0, currentY, strings.Repeat("─", w))
-	putStr(u.s, 2, currentY, " Status ")
-	currentY++
-
 	if len(u.statusLines) > 0 {
+		putStr(u.s, 0, currentY, strings.Repeat("─", w))
+		putStr(u.s, 2, currentY, " Status ")
+		currentY++
 		for _, line := range u.statusLines {
 			if currentY >= h {
 				break
@@ -191,143 +194,52 @@ func (u *UI) LayoutAndDraw() {
 			putStr(u.s, 0, currentY, line)
 			currentY++
 		}
-	} else {
-		mode := "REAL"
-		if u.emulate {
-			mode = "EMULATE"
-		}
-		el := time.Since(u.start).Truncate(time.Second)
-		putStr(u.s, 0, currentY, fmt.Sprintf("Absolute: %06d", u.curAbs))
-		currentY++
-		putStr(u.s, 0, currentY, fmt.Sprintf("Written: %d / %d sectors", u.written, u.totalSectors))
-		currentY++
-
-		var rateBps float64
-		if u.emulate {
-			rateBps = u.rateBps
-		} else {
-			if elapsed := time.Since(u.start).Seconds(); elapsed > 0 {
-				rateBps = float64(u.written*512) / elapsed
-			}
-		}
-		// ETA
-		var etaStr string
-		if rateBps > 0 {
-			remainBytes := (u.totalSectors - u.written) * 512
-			eta := time.Duration(float64(remainBytes) / rateBps * float64(time.Second)).Truncate(time.Second)
-			etaStr = eta.String()
-		} else {
-			etaStr = "—"
-		}
-
-		rateStr := human(int64(rateBps))
-		putStr(u.s, 0, currentY, fmt.Sprintf("Elapsed: %s   Rate: %s/s   ETA: %s   Mode: %s", el, rateStr, etaStr, mode))
-		currentY++
-		putStr(u.s, 0, currentY, "Current op: "+u.currentOp)
 	}
 
 	u.s.Show()
 }
 
-func (u *UI) drawSectorMap(x, y, w, h int) {
-	total := u.totalSectors
-	if total <= 0 || h <= 0 {
-		return
-	}
-	win := int64(w * h)
-	start := int64(0)
-	if total > win {
-		if u.curAbs >= win-1 {
-			start = u.curAbs - (win - 1)
-		}
-		if start+win > total {
-			start = total - win
-		}
-	}
-
-	sectorsToShow := total - start
-	if sectorsToShow > win {
-		sectorsToShow = win
-	}
-
-	inSystem := func(abs int64) bool {
-		for _, r := range u.systemRanges {
-			if abs >= r.start && abs <= r.end {
-				return true
-			}
-		}
-		return false
-	}
-
-	idx := int64(0)
-	for row := 0; row < h; row++ {
-		for col := 0; col < w; col++ {
-			if idx >= sectorsToShow {
-				return
-			}
-			abs := start + idx
-			var rch = u.free
-			if u.sectorMap[abs] {
-				rch = u.full
-			} else if inSystem(abs) {
-				rch = u.sys
-			}
-			u.s.SetContent(x+col, y+row, rch, nil, tcell.StyleDefault)
-			idx++
-		}
-	}
-}
-
-// API
+// SetPhaseDone marks the specified phase as completed.
+// The phase name is case-insensitive.
 func (u *UI) SetPhaseDone(p string) {
 	if u.phaseDoneMap == nil {
 		u.phaseDoneMap = make(map[string]bool)
 	}
 	u.phaseDoneMap[strings.ToLower(p)] = true
 }
-func (u *UI) SetPhases(labels []string) { u.phases = append([]string(nil), labels...) }
-func (u *UI) SetTitle(t string)         { u.title = t }
-func (u *UI) SetSystemRanges(ranges [][2]int64) {
-	u.systemRanges = u.systemRanges[:0]
-	for _, r := range ranges {
-		u.systemRanges = append(u.systemRanges, struct{ start, end int64 }{start: r[0], end: r[1]})
-	}
-}
-func (u *UI) AddSystemRange(start, end int64) {
-	u.systemRanges = append(u.systemRanges, struct{ start, end int64 }{start: start, end: end})
-}
-func (u *UI) SetSummaryLines(lines []string) { u.summaryLines = append([]string(nil), lines...) }
-func (u *UI) SetLegend(lines []string)       { u.legendLines = append([]string(nil), lines...) }
-func (u *UI) SetStatusLines(lines []string)  { u.statusLines = append([]string(nil), lines...) }
 
-func (u *UI) SetCurrentOp(op string) { u.currentOp = op }
-func (u *UI) SetRate(bps float64)    { u.rateBps = bps }
-func (u *UI) SetEmu(em bool)         { u.emulate = em }
-func (u *UI) SetUpdateEvery(n int) {
-	if n < 1 {
-		n = 1
-	}
-	u.updateEvery = n
-}
-func (u *UI) SetSyncMode(m string) { u.syncMode = strings.ToLower(strings.TrimSpace(m)) }
-
-func (u *UI) MarkRange(absStart int64, sectors int64) {
-	end := absStart + sectors
-	if end > u.totalSectors {
-		end = u.totalSectors
-	}
-	for i := absStart; i < end; i++ {
-		if !u.sectorMap[i] {
-			u.sectorMap[i] = true
-			u.written++
-		}
-	}
-	if end-1 >= 0 {
-		u.curAbs = end - 1
-	}
+// SetPhases sets the list of phases to display.
+// Phases will be shown with checkmarks as they are marked done via SetPhaseDone.
+func (u *UI) SetPhases(labels []string) {
+	u.phases = append([]string(nil), labels...)
 }
 
-func (u *UI) TotalSectors() int64 { return u.totalSectors }
+// SetTitle sets the title displayed at the top of the UI.
+func (u *UI) SetTitle(t string) {
+	u.title = t
+}
+
+// SetSummaryLines sets the summary/info lines displayed below the title.
+func (u *UI) SetSummaryLines(lines []string) {
+	u.summaryLines = append([]string(nil), lines...)
+}
+
+// SetLegend sets the legend lines displayed below the summary.
+func (u *UI) SetLegend(lines []string) {
+	u.legendLines = append([]string(nil), lines...)
+}
+
+// SetStatusLines sets the status lines displayed at the bottom of the UI.
+func (u *UI) SetStatusLines(lines []string) {
+	u.statusLines = append([]string(nil), lines...)
+}
+
+// SetProgressMap sets the visual progress map lines to display.
+// Each string represents a row of the progress visualization.
+// The UI simply renders what is provided - it does not track progress.
+func (u *UI) SetProgressMap(lines []string) {
+	u.progressMapLines = append([]string(nil), lines...)
+}
 
 func (u *UI) eventLoop() {
 	go func() {
@@ -357,14 +269,4 @@ func (u *UI) eventLoop() {
 			}
 		}
 	}()
-}
-
-func human(b int64) string {
-	if b >= 1024*1024 {
-		return fmt.Sprintf("%dM", b/(1024*1024))
-	}
-	if b >= 1024 {
-		return fmt.Sprintf("%dK", b/1024)
-	}
-	return fmt.Sprintf("%dB", b)
 }
